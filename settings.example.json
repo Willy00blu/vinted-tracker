@@ -1,0 +1,5 @@
+{
+  "smtp_user": "your_gmail@gmail.com",
+  "smtp_pass": "your_app_password",
+  "email_to":  "destination@email.com"
+}
