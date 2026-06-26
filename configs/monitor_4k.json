@@ -3,14 +3,13 @@
   "label": "Monitor 4K",
   "min_price": 120,
   "max_price": 600,
-  "check_interval_minutes": 15,
+  "check_interval_minutes": 30,
   "seen_file": "seen_monitor_4k_ids.json",
   "price_db_file": null,
   "domains": [
     "https://www.vinted.it",
     "https://www.vinted.fr",
-    "https://www.vinted.de",
-    "https://www.vinted.com"
+    "https://www.vinted.de"
   ],
   "queries": [
     "monitor 27 4k",
@@ -36,7 +35,10 @@
     "iiyama 27 4k"
   ],
   "keywords_required": [
-    "4k", "uhd", "3840", "4096"
+    "4k",
+    "uhd",
+    "3840",
+    "4096"
   ],
   "brands_required": [
     "asus",
@@ -69,6 +71,13 @@
     "24 inch",
     "24 pouces"
   ],
-  "email_subject": "🔔 {count} nuovo/i articolo/i su Vinted — Monitor 4K!",
-  "email_intro": "Nuovi annunci trovati su Vinted per: Monitor 4K"
+  "min_favourites": 0,
+  "max_pages": 1,
+  "request_delay_seconds": 0.1,
+  "anomaly_threshold_pct": 30,
+  "anomaly_min_samples": 20,
+  "price_drop_threshold_pct": 15,
+  "price_drop_min_abs": 5.0,
+  "email_subject": "🔔 {count} new listing(s) on Vinted — Monitor 4K!",
+  "email_intro": "New listings found on Vinted for: Monitor 4K"
 }

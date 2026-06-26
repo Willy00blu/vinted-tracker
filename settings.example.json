@@ -1,5 +1,4 @@
 {
-  "smtp_user": "your_gmail@gmail.com",
-  "smtp_pass": "your_app_password",
-  "email_to":  "destination@email.com"
+  "telegram_bot_token": "123456:ABC-DEF...",
+  "telegram_chat_id":   "123456789"
 }

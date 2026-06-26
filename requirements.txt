@@ -1,2 +1,9 @@
 vinted-scraper
 psutil
+httpx
+# Optional — embedding-based clustering for the category monitor.
+# If unavailable, clustering gracefully falls back to naive tokens.
+sentence-transformers
+# Optional — density-aware clustering for the Regenerate button.
+# When present, splits dense sub-groups (e.g. iPhone 13 / Pro / Pro Max).
+hdbscan

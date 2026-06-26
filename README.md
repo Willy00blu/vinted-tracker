@@ -22,7 +22,9 @@ A desktop tool that watches [Vinted](https://www.vinted.com) for you and sends a
 ## Features
 
 - Track **any search** across Vinted Italy, France, Germany and .com simultaneously
-- **Email alerts** as soon as a new matching listing appears
+- **Telegram alerts** as soon as a new matching listing appears
+- **Anomaly detection** — automatically flag listings priced significantly below the market median, learned from your own scraped data
+- **Per-search statistics panel** — distribution histogram, median, recent flagged anomalies
 - **Smart WiFi handling** — if you lose connection, a full scan runs the moment it comes back
 - **GUI** to manage all your searches in one place (start, stop, restart, add, remove)
 - **Live log** — see scraping results in real time inside the app
@@ -40,7 +42,7 @@ cd vinted-tracker
 pip install -r requirements.txt
 ```
 
-### 2. Configure email credentials
+### 2. Configure Telegram credentials
 
 ```bash
 cp settings.example.json settings.json
@@ -50,13 +52,12 @@ Open `settings.json` and fill in your details:
 
 ```json
 {
-  "smtp_user": "your_gmail@gmail.com",
-  "smtp_pass": "your_app_password",
-  "email_to":  "destination@email.com"
+  "telegram_bot_token": "123456:ABC-DEF...",
+  "telegram_chat_id":   "123456789"
 }
 ```
 
-> **Gmail users:** you need an [App Password](https://myaccount.google.com/apppasswords), not your regular password.
+> **How to get them:** talk to [@BotFather](https://t.me/BotFather) on Telegram, send `/newbot`, follow the prompts and copy the token. Then send `/start` to your new bot, and ask [@userinfobot](https://t.me/userinfobot) for your numeric chat id.
 
 ### 3. Launch the GUI
 
@@ -80,6 +81,11 @@ Click **+ Add** in the app and fill in the form:
 | Required keywords | All results must include at least one | `iphone,15 pro` |
 | Required brands (optional) | Must match a brand | `apple` |
 | Exclude keywords | Disqualify listings containing these | `broken,spare parts` |
+| Min likes ♥ | Skip listings with fewer favourites (`0` = no filter) | `5` |
+| Pages per scan | How many pages to fetch per query (96 items/page) | `3` |
+| Delay between calls (sec) | Pause between API requests — lower is faster but riskier | `1` |
+| Anomaly threshold % | Flag prices N% below the market median (`0` = off) | `30` |
+| Min samples before flagging | How many prices to collect before anomaly detection kicks in | `20` |
 
 The config is saved to `configs/` and picked up automatically — no restart needed.
 
@@ -141,6 +147,11 @@ Each file in `configs/` follows this schema:
   "keywords_required":  ["iphone", "15 pro"],  // at least one must match
   "brands_required":    ["apple"],             // at least one must match (or empty = any)
   "keywords_exclude":   ["rotto", "broken"],   // listing is skipped if any match
+  "min_favourites":     0,                     // skip listings with fewer ♥ (0 = no filter)
+  "max_pages":          1,                     // pages to fetch per query (96 items/page)
+  "request_delay_seconds": 2.0,                // pause between API calls (lower = faster, risk ban)
+  "anomaly_threshold_pct": 0,                  // flag prices N% below median (0 = disabled)
+  "anomaly_min_samples":   20,                 // min collected prices before flagging starts
   "email_subject":      "🔔 {count} nuovo/i articolo/i su Vinted — iPhone 15 Pro!",
   "email_intro":        "Nuovi annunci trovati su Vinted per: iPhone 15 Pro"
 }
