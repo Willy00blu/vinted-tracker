@@ -606,8 +606,9 @@ def _embed_text(item: dict, exclude_brand: str | None = None) -> str:
     # title="appletv 4k" (apple is in 'appletv' substring but not as a token).
     if brand and not re.search(rf"\b{re.escape(brand)}\b", norm):
         norm = _normalize(f"{brand} {title}")
-    # Strip noise tokens. Brand-tokens are preserved (signal). Tokens <2 chars
-    # already filtered by _normalize.
+    # Strip noise tokens. Brand-tokens are preserved (signal). NOTE: _normalize
+    # does NOT length-filter tokens — single-char tokens survive unless they're
+    # in _NOISE. Kept deliberately (single-letter model codes: Sony A, Canon M).
     brand_tokens = set(brand.split()) if brand else set()
     # Intra-partition: also strip the partition's brand token(s).
     skip_tokens: set[str] = set()
@@ -677,13 +678,56 @@ def _naive_cluster_key(title: str, brand: str | None) -> str:
 #   0.90+ → quasi tutto singleton, embedding inutile
 SIMILARITY_THRESHOLD = 0.82
 
-# Review interventions on the ALWAYS-ON incremental path (toggleable; defaults
-# preserve current behavior). #1: true running-mean centroid update instead of
-# the EMA(α=0.5) `(old+emb)/2` that overweights the most recent item and lets
-# centroids drift between regenerations. #7: vectorized centroid match (one
-# matmul) instead of a Python double-loop over all centroids per item.
-INCREMENTAL_RUNNING_MEAN = False
-INCREMENTAL_VECTOR_MATCH = False
+# ALWAYS-ON incremental path fixes. #1: true running-mean centroid update
+# instead of the EMA(α=0.5) `(old+emb)/2` that overweights the most recent
+# item and lets centroids drift between regenerations. #7: vectorized centroid
+# match (one matmul) instead of a Python double-loop over all centroids per
+# item. VALIDATED 2026-06-29 (scripts/test_incremental.py, 60k items, 7.4k
+# clusters): assignment accuracy 49.6% (ema) → 62.7% (runmean), centroid
+# drift-cos 0.975 → 0.997 → enabled by default.
+INCREMENTAL_RUNNING_MEAN = True
+INCREMENTAL_VECTOR_MATCH = True
+
+# Band-aware incremental match: price-band siblings of the same product
+# ("<base> [€a-b]", "<base> #highN"…) have near-identical TEXT centroids, so a
+# cosine-only matcher routes new items among them by coin flip — a game priced
+# €20 landing in the console band looks like a −85% deal (false positive on
+# live inflow). When the text-matched key has band siblings and the item has a
+# price, re-route to the sibling with the closest log-price median (persisted
+# per centroid in cluster_centroids.price_median). No-op without siblings or
+# medians (legacy DBs) — safe to keep always on.
+BAND_AWARE_MATCH = True
+_PRICE_BAND_TAG = re.compile(r" \[€[^\]]*\]| #high\d+| #low\d+| \[\?\]")
+
+
+def _band_base_index(medians: dict) -> dict:
+    """{base_key: [(cluster_key, price_median), …]} for bases with ≥2 bands.
+    `medians` maps cluster_key → price_median (may contain None values)."""
+    from collections import defaultdict
+    idx = defaultdict(list)
+    for k, med in medians.items():
+        idx[_PRICE_BAND_TAG.sub("", k)].append((k, med))
+    return {b: sibs for b, sibs in idx.items() if len(sibs) >= 2}
+
+
+def _band_route(best_key: str, price, base_index: dict) -> str:
+    """Re-route a text-matched key among its price-band siblings by log-price
+    adjacency. Returns `best_key` unchanged when the item has no price, the key
+    has no siblings, or no sibling has a stored median."""
+    if not BAND_AWARE_MATCH or not price or price <= 0:
+        return best_key
+    sibs = base_index.get(_PRICE_BAND_TAG.sub("", best_key))
+    if not sibs:
+        return best_key
+    import math
+    lp = math.log(price)
+    best, bd = best_key, None
+    for k, med in sibs:
+        if med and med > 0:
+            d = abs(lp - math.log(med))
+            if bd is None or d < bd:
+                bd, best = d, k
+    return best
 
 # ─── Cluster refinement (regenerate path) ───────────────────────────────────
 # After the density pass we run two refinements, validated offline against the
@@ -987,21 +1031,27 @@ def cluster_titles_batch(items: list[dict], conn=None) -> dict[int, str]:
     if not needs_embed:
         return result
 
-    # Load existing centroids (one query, then keep in memory). When the
-    # running-mean update is enabled (#1) we also load item_count so the
-    # update can weight by the cluster's current size.
+    # Load existing centroids (one query, then keep in memory), plus item_count
+    # (running-mean weighting, #1) and price_median (band-aware routing).
+    # Legacy DBs may miss price_median → fall back to a NULL-median select.
     centroids: dict[str, "np.ndarray"] = {}
     counts: dict[str, int] = {}
-    _sel = ("SELECT cluster_key, embedding, item_count FROM cluster_centroids"
-            if INCREMENTAL_RUNNING_MEAN else
-            "SELECT cluster_key, embedding FROM cluster_centroids")
-    for row in conn.execute(_sel):
+    medians: dict[str, float | None] = {}
+    try:
+        rows_c = list(conn.execute(
+            "SELECT cluster_key, embedding, item_count, price_median "
+            "FROM cluster_centroids"))
+    except Exception:
+        rows_c = [(r[0], r[1], r[2], None) for r in conn.execute(
+            "SELECT cluster_key, embedding, item_count FROM cluster_centroids")]
+    for row in rows_c:
         try:
             centroids[row[0]] = _blob_to_emb(row[1])
-            if INCREMENTAL_RUNNING_MEAN:
-                counts[row[0]] = int(row[2] or 1)
+            counts[row[0]] = int(row[2] or 1)
+            medians[row[0]] = row[3]
         except Exception:
             continue
+    band_index = _band_base_index(medians) if BAND_AWARE_MATCH else {}
 
     # Encode all titles in one batch (much faster than one-by-one).
     # Embed brand+title (see _embed_text) for better discrimination.
@@ -1050,6 +1100,10 @@ def cluster_titles_batch(items: list[dict], conn=None) -> dict[int, str]:
                     best_key = ck
 
         if best_key is not None and best_sim >= SIMILARITY_THRESHOLD:
+            # Band-aware re-route among price-band siblings (no-op otherwise).
+            routed = _band_route(best_key, it.get("price"), band_index)
+            if routed != best_key and routed in centroids:
+                best_key = routed
             # Merge into existing cluster — centroid update.
             old = centroids[best_key]
             if INCREMENTAL_RUNNING_MEAN:
@@ -1083,7 +1137,8 @@ def cluster_titles_batch(items: list[dict], conn=None) -> dict[int, str]:
             # Vinted category is known (extracted during sold-check), else NULL
             # so the GUI falls back to the raw cluster_key.
             display = _display_label(new_key, it.get("category"))
-            ins_new.append((new_key, _emb_to_blob(emb), now, display))
+            price_med = float(it["price"]) if (it.get("price") and it["price"] > 0) else None
+            ins_new.append((new_key, _emb_to_blob(emb), now, display, price_med))
 
     # Persist centroid updates / inserts in batch. We catch and re-raise
     # with extra context because executemany's default error message swallows
@@ -1111,8 +1166,9 @@ def cluster_titles_batch(items: list[dict], conn=None) -> dict[int, str]:
             conn.executemany(
                 """
                 INSERT INTO cluster_centroids
-                    (cluster_key, embedding, item_count, last_updated_at, display_label)
-                VALUES (?, ?, 1, ?, ?)
+                    (cluster_key, embedding, item_count, last_updated_at,
+                     display_label, price_median)
+                VALUES (?, ?, 1, ?, ?, ?)
                 """,
                 ins_new,
             )
@@ -1241,17 +1297,15 @@ def _hdbscan_compute(items: list[dict], namespace: str,
         min_samples = 1
     elif n_part < 200:
         min_samples = 2
-    elif n_part < 2000:
-        min_samples = 3
     else:
-        min_samples = 3   # mega partitions: density estimate stable enough
+        min_samples = 3   # large/mega partitions: density estimate stable enough
     clusterer = _get_hdbscan().HDBSCAN(
         min_cluster_size      = min_cluster_size,
         min_samples           = min_samples,
         metric                = "euclidean",
         algorithm             = "boruvka_balltree",
         approx_min_span_tree  = True,
-        cluster_selection_method = "eom",
+        cluster_selection_method = HDBSCAN_SELECTION,
         core_dist_n_jobs      = n_jobs,
     )
     labels = clusterer.fit_predict(embs_for_cluster)
@@ -1266,11 +1320,14 @@ def _hdbscan_compute(items: list[dict], namespace: str,
             noise_embs_idx.append(idx)
             continue
         b = by_label.setdefault(
-            int(label), {"ids": [], "embs": [], "titles": [], "cats": []})
+            int(label), {"ids": [], "embs": [], "titles": [], "cats": [],
+                         "prices": []})
         b["ids"].append(it["id"])
         b["embs"].append(emb)
         b["titles"].append(it.get("title", ""))
         b["cats"].append((it.get("category") or "").strip())
+        if it.get("price") and it["price"] > 0:
+            b["prices"].append(float(it["price"]))
 
     from collections import Counter as _Counter
     now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1307,9 +1364,12 @@ def _hdbscan_compute(items: list[dict], namespace: str,
         # Display label uses the readable (un-namespaced) product name so we
         # don't repeat the category (e.g. "games · jeu ps4", not
         # "games · games/jeu ps4").
+        pr = sorted(data["prices"])
+        price_med = pr[len(pr) // 2] if pr else None
         centroid_rows.append((
             key, _emb_to_blob(mean_vec.astype("float32")),
             len(data["ids"]), now_ts, _display_label(readable, top_cat),
+            price_med,
         ))
         centroid_vecs.append((key, n_centroid))
 
@@ -1338,8 +1398,8 @@ def _hdbscan_compute(items: list[dict], namespace: str,
     if n_rescued:
         counts = _Counter(result.values())
         centroid_rows = [
-            (k, blob, counts.get(k, dc), ts, lab)
-            for k, blob, dc, ts, lab in centroid_rows
+            (k, blob, counts.get(k, dc), ts, lab, med)
+            for k, blob, dc, ts, lab, med in centroid_rows
         ]
     return result, centroid_rows
 
@@ -1355,8 +1415,9 @@ def _persist_centroids(conn, centroid_rows: list[tuple], wipe: bool) -> None:
         conn.executemany(
             """
             INSERT INTO cluster_centroids
-                (cluster_key, embedding, item_count, last_updated_at, display_label)
-            VALUES (?, ?, ?, ?, ?)
+                (cluster_key, embedding, item_count, last_updated_at,
+                 display_label, price_median)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             centroid_rows,
         )
@@ -1579,7 +1640,7 @@ def eval_metrics(items: list[dict], mapping: dict[int, str],
     }
 
 
-# ── Partition sharding for HDBSCAN parallelism (opt; default off) ───────────
+# ── Partition sharding for HDBSCAN parallelism ──────────────────────────────
 # The single largest partition (typically the brand/family-less __nobrand__
 # residual) runs HDBSCAN alone in one worker → it's the serial wall-clock
 # bottleneck (super-linear in N). When enabled, partitions bigger than
@@ -1587,9 +1648,20 @@ def eval_metrics(items: list[dict], mapping: dict[int, str],
 # ~PARTITION_SHARD_TARGET items, which then run in PARALLEL across the pool.
 # Items inside a KMeans chunk are embedding-neighbours, so a real product
 # cluster mostly stays within one chunk (the cost is rare boundary fragments).
-PARALLEL_SHARD_LARGE   = False
+# Default ON since 2026-06-29: cuts the full-DB partition from ~38 min to
+# ~7 min with no quality loss (A/B: sharded default-config OBJ 0.274 vs
+# unsharded production 0.179 on the same corpus, scripts/confirm_full.py).
+PARALLEL_SHARD_LARGE   = True
 PARTITION_SHARD_CAP    = 6000
 PARTITION_SHARD_TARGET = 4000
+HDBSCAN_SELECTION      = "eom"   # "eom" | "leaf" (leaf → finer/smaller clusters)
+PARTITION_FAMILY_FOR_BRANDED = False  # partition branded items by cat|brand|family
+                                      # so device+accessory can't co-cluster at the
+                                      # source (see loop in cluster_partitioned)
+DISABLE_POOL           = False   # run heavy partitions in the main thread (no
+                                 # ProcessPoolExecutor) — avoids spawn-reimport
+                                 # deadlocks when called from scripts that import
+                                 # heavy modules; fine with sharding (small parts)
 
 
 def _shard_large_partitions(by_part: dict, emb_cache, log_fn) -> dict:
@@ -1712,6 +1784,15 @@ def cluster_partitioned(items: list[dict], conn,
                 part = f"__nobrand__|{fam}"
             else:
                 part = "__nobrand__"
+        # Experimental (PARTITION_FAMILY_FOR_BRANDED): extend the key with the
+        # family hint for BRANDED items too, so HDBSCAN can't merge a device
+        # with its accessories at the source (nintendo|game vs nintendo).
+        # Risk: the same product with/without the family word in its title
+        # lands in different partitions (fragmentation) — judged by benchmark.
+        if PARTITION_FAMILY_FOR_BRANDED and brand:
+            fam_b = _family_of(it)
+            if fam_b:
+                part = f"{part}|{fam_b}"
         by_part.setdefault(part, []).append(it)
 
     # Optional: pre-shard oversized partitions so the biggest one parallelizes
@@ -1766,6 +1847,16 @@ def cluster_partitioned(items: list[dict], conn,
 
     # 1) HEAVY partitions in parallel
     n_done = 0
+    if heavy and DISABLE_POOL:
+        # Sequential main-thread path (no ProcessPoolExecutor).
+        for part, part_items in heavy:
+            ns = "" if part.startswith("__nobrand__") else f"{part}/"
+            m_local, rows_local = _hdbscan_compute(
+                part_items, ns, min_cluster_size, lambda *a, **k: None,
+                emb_cache, n_jobs=1)
+            _process_results(part, part_items, m_local, rows_local)
+            n_done += 1
+        heavy = []   # skip the pool block below
     if heavy:
         jobs = []   # (part, ns, part_items, sub_cache)
         for part, part_items in heavy:
@@ -2204,8 +2295,8 @@ def _drop_floor_spam(groups: dict, log_fn, *,
                    if it.get("price") and 0 < it["price"] <= threshold]
         if not to_drop or len(to_drop) > max_drop_frac * len(v):
             out[k] = v; continue
-        kept_ids = {id(it) for it in to_drop}
-        out[k] = [it for it in v if id(it) not in kept_ids]
+        dropped_ids = {id(it) for it in to_drop}
+        out[k] = [it for it in v if id(it) not in dropped_ids]
         out.setdefault(f"{k} #floorspam", []).extend(to_drop)
         n_dropped += len(to_drop)
     if n_dropped:
@@ -2439,10 +2530,45 @@ def _merge_by_lex_signature(groups: dict, emb_of, log_fn, *,
 # ─── REVIEW INTERVENTIONS (toggleable; defaults preserve current behavior) ──
 # Each flag defaults to the *current* pipeline so refine_clusters is a no-op
 # change until a flag is flipped (the A/B harness flips them per-variant).
-ENABLE_MODEL_TOKEN_SPLIT = False   # #2: lexical model-code split (CPU/GPU)
-STABLE_MERGE_KEY         = False   # #8: deterministic merge name-key (vs medoid)
-LOGSPACE_BITAIL          = False   # #6: bi-tail MAD in log-price space
-CONSOLIDATE_PRICE_SPLIT  = False   # #10: drop the 2nd Jenks2 pass + baseline guard
+ENABLE_MODEL_TOKEN_SPLIT = False# #2: lexical model-code split (CPU/GPU)
+ENABLE_OUTLIER_EJECT     = False   # adaptive: eject members far from a TIGHT
+                                   # cluster's centroid (threshold rises with the
+                                   # cluster's own cohesion) — kicks out accessories
+                                   # /wrong-brand intruders the price-split misses
+ENABLE_MIXTURE_SPLIT     = True# FINAL pass: split device+accessory/game price
+                                   # mixtures (gvf≥0.6, ratio≥3, no emb gate) that
+                                   # share the brand token so text can't separate
+ENABLE_PRODUCT_SPLIT     = False# storage-aware model-id split, ALL clusters
+                                   # (iPhone 12≠13, Galaxy S21≠S22, i5-6600≠6500;
+                                   # storage tiers 64≠256 and years are ignored)
+STABLE_MERGE_KEY         = True# #8: deterministic merge name-key (vs medoid)
+LOGSPACE_BITAIL          = False# #6: bi-tail MAD in log-price space
+CONSOLIDATE_PRICE_SPLIT  = False# #10: drop the 2nd Jenks2 pass + baseline guard
+DISABLE_BITAIL           = False# experiment: skip ONLY the bi-tail (#high/#low)
+                                   # pure price-tier split; keep Jenks2 (which is
+                                   # emb-gated → only splits real product mixtures)
+DISABLE_PRICE_SPLIT      = False# experiment: skip ALL price splitting (Jenks2
+                                   # ×2 + bi-tail) — isolates the coverage↔purity
+                                   # fragmentation lever. SEMANTIC splits (mixtures)
+                                   # are what we want; pure price-tier splits drop
+                                   # items below the detector's size floor.
+
+# Tunable refine thresholds (defaults == current production values, so leaving
+# them untouched is a no-op). The config-search (scripts/ab_search.py) patches
+# these to explore the clustering-quality space.
+TUNE_JENKS_GVF     = 0.6# _price_split_jenks2 min GVF (↑ = split less)
+TUNE_JENKS_RATIO   = 2.0# _price_split_jenks2 min center ratio
+TUNE_JENKS_COS     = 0.97# _price_split_jenks2 max emb-cos (↓ = split less)
+TUNE_BITAIL_MADK   = 2.5# _right_tail_split mad_k (↑ = split less)
+TUNE_SIBLING_RATIO = 1.15# _merge_sibling_fragments max median ratio (↑ = merge more)
+TUNE_SIBLING_COS   = 0.97# _merge_sibling_fragments min emb-cos (↓ = merge more)
+TUNE_LEXSIG_COS    = 0.98# _merge_by_lex_signature min emb-cos (↓ = merge more)
+TUNE_LEXSIG_RATIO  = 1.1# _merge_by_lex_signature max median ratio (↑ = merge more)
+TUNE_MIX_GVF       = 0.6# _mixture_split min GVF (↑ = split fewer mixtures)
+TUNE_MIX_RATIO     = 2.5# _mixture_split min modal ratio (↑ = split fewer)
+TUNE_EJECT_K       = 3.0    # _eject_embedding_outliers robust-z (↓ = eject more)
+TUNE_EJECT_MINMED  = 0.92   # only eject from clusters whose median cohesion ≥ this
+TUNE_EJECT_FLOOR   = 0.90   # never eject members with cos ≥ this (legit variation)
 
 # ── #2: model-token split for tech (CPU/GPU/RAM/SSD) partitions ─────────────
 _TECH_BRANDS = {"intel", "amd", "nvidia"}
@@ -2514,6 +2640,151 @@ def _split_by_model_token(groups: dict, log_fn, *,
         n_split += 1
     if n_split:
         log_fn(f"  model-token split: {n_split} cluster tech spaccati per SKU")
+    return out
+
+
+_YEAR_TOK = re.compile(r"^(19|20)\d\d$")
+
+
+def _model_ids(title: str) -> frozenset:
+    """Model-identity numeric tokens from a title, in the same normalized space
+    the pipeline uses. EXCLUDES storage tiers ('128' in '128 gb') and listing
+    years ('2021') — those are specs/metadata, not product identity. So
+    'iphone 12 128gb' and 'iphone 12 256gb' share id {'12'}, while 'iphone 13'
+    differs ({'13'})."""
+    toks = _normalize(title).split()
+    out = set()
+    for i, t in enumerate(toks):
+        if not any(c.isdigit() for c in t):
+            continue
+        if _YEAR_TOK.match(t) or t in _NOISE or len(t) > 7:
+            continue
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if t.isdigit() and nxt in ("gb", "tb", "mb"):     # storage tier → skip
+            continue
+        out.add(t)
+    return frozenset(out)
+
+
+def _split_by_product_id(groups: dict, log_fn, *,
+                         min_size: int = 12, min_subgroup: int = 4) -> dict:
+    """Split a cluster into distinct model identities when ≥2 model-id groups
+    each have ≥min_subgroup items. Items with no model-id (number-less titles,
+    e.g. 'Nintendo Switch Lite') stay together in the main cluster — they are
+    not split. Catches HDBSCAN over-merges of near-homograph models that a dense
+    text encoder can't separate (iPhone 12/13, Galaxy S21/S22, i5-6600/6500)."""
+    out: dict[str, list] = {}
+    n_split = 0
+    for k, v in groups.items():
+        if any(tag in k for tag in (" #high", " #low", " #img", " #floor",
+                                    "[€", "[?]", "::")):
+            out[k] = v; continue
+        if len(v) < min_size:
+            out[k] = v; continue
+        sig: dict[frozenset, list] = {}
+        for it in v:
+            sig.setdefault(_model_ids(it.get("title", "")), []).append(it)
+        big = {s: g for s, g in sig.items() if s and len(g) >= min_subgroup}
+        if len(big) < 2:
+            out[k] = v; continue
+        leftover = [it for s, g in sig.items()
+                    if not (s and len(g) >= min_subgroup) for it in g]
+        for s, g in big.items():
+            tag = "-".join(sorted(s))[:20]
+            out[f"{k} ::p:{tag}"] = g
+        if leftover:
+            out[k] = leftover
+        n_split += 1
+    if n_split:
+        log_fn(f"  product-id split: {n_split} cluster spaccati per identità modello")
+    return out
+
+
+def _eject_embedding_outliers(groups: dict, emb_of, log_fn, *,
+                              min_size: int = 10, k: float = 3.0,
+                              min_median_cos: float = 0.92,
+                              max_keep_cos: float = 0.90,
+                              max_eject_frac: float = 0.30) -> dict:
+    """Adaptive cohesion-gated purity filter (user's idea): in a TIGHT cluster
+    (median cos-to-centroid ≥ min_median_cos) the bar to belong is high, so a
+    member whose cos sits below `median − k·MAD` is an embedding outlier (an
+    accessory/part/wrong-brand intruder that shares the brand token) and is
+    EJECTED to a singleton. Loose clusters (low median cohesion) are left
+    untouched — the threshold literally rises with the cluster's own tightness.
+    Catches contamination the price-split misses (same price, different product)."""
+    import statistics as _st
+    out: dict[str, list] = {}
+    n_ej = 0
+    for key, v in groups.items():
+        ids = [it for it in v if it["id"] in emb_of]
+        if len(ids) < min_size:
+            out[key] = v; continue
+        V = np.array([emb_of[it["id"]] for it in ids], dtype=np.float32)
+        V = V / np.maximum(np.linalg.norm(V, axis=1, keepdims=True), 1e-12)
+        cen = V.mean(0); cen = cen / max(float(np.linalg.norm(cen)), 1e-12)
+        sims = V @ cen
+        med = float(np.median(sims))
+        if med < min_median_cos:
+            out[key] = v; continue                 # loose cluster → don't touch
+        mad = 1.4826 * float(np.median(np.abs(sims - med))) or 1e-6
+        thr = med - k * mad
+        # Eject only items that are BOTH statistical outliers AND below an
+        # absolute floor — so legit title variation in a very tight cluster
+        # (tiny MAD) isn't ejected, only genuinely-different products.
+        ej_idx = [i for i, s in enumerate(sims) if s < thr and s < max_keep_cos]
+        if not ej_idx or len(ej_idx) > max_eject_frac * len(ids):
+            out[key] = v; continue
+        ej_set = {ids[i]["id"] for i in ej_idx}
+        out[key] = [it for it in v if it["id"] not in ej_set]
+        for j, i in enumerate(ej_idx):
+            out[f"{key} #out{j}"] = [ids[i]]        # unique singleton, drops out
+        n_ej += len(ej_idx)
+    if n_ej:
+        log_fn(f"  outlier-eject: {n_ej} intrusi espulsi da cluster compatti "
+               f"(soglia adattiva med−{k}·MAD)")
+    return out
+
+
+def _mixture_split(groups: dict, log_fn, *, min_gvf: float = 0.60,
+                   min_ratio: float = 3.0, min_band: int = 3,
+                   max_iters: int = 2) -> dict:
+    """FINAL device+accessory de-mixer. Splits a cluster on its log-price Jenks2
+    break when the two modes are strong (GVF≥min_gvf) and far apart
+    (ratio≥min_ratio), each ≥min_band items — NO embedding gate (the mixture
+    shares the brand+model token, so text similarity is high; price bimodality
+    is the only reliable signal). Iterates so a 3-way mix (accessory/game/device)
+    fully separates. Runs after the merges so it also catches mixtures the merges
+    re-created."""
+    import math
+    work = list(groups.items())
+    out: dict[str, list] = {}
+    n_split = 0
+    while work:
+        k, v = work.pop()
+        priced = [it for it in v if it.get("price") and it["price"] > 0]
+        noprice = [it for it in v if not (it.get("price") and it["price"] > 0)]
+        if len(priced) < 2 * min_band:
+            out[k] = v; continue
+        stats = _jenks2_stats([it["price"] for it in priced], min_band=min_band)
+        if not stats:
+            out[k] = v; continue
+        idx, gvf, ratio = stats
+        if gvf < min_gvf or ratio < min_ratio:
+            out[k] = v; continue
+        sp = sorted(priced, key=lambda it: it["price"])
+        A = sp[:idx]; B = sp[idx:]
+        n_split += 1
+        ka = f"{k} [€{int(A[0]['price'])}-{int(A[-1]['price'])}]"
+        kb = f"{k} [€{int(B[0]['price'])}-{int(B[-1]['price'])}]"
+        # re-feed both sides (bounded) so multi-modal clusters fully separate
+        depth = k.count("[€")
+        if depth < max_iters:
+            work.append((ka, A)); work.append((kb, B + noprice))
+        else:
+            out[ka] = A; out[kb] = B + noprice
+            continue
+    if n_split:
+        log_fn(f"  mixture-split: {n_split} split device+accessori/giochi per prezzo")
     return out
 
 
@@ -2630,7 +2901,11 @@ def refine_clusters(items: list[dict], mapping: dict[int, str], conn,
     # Dry-run (scripts/dry_run_price_split.py) on 88k items: 544 splits over
     # 2507 candidates — 1754 blocked by emb-check (same-product protection).
     # Old gap-based `_price_band_split` kept above for reference / opt-in.
-    groups = _price_split_jenks2(groups, emb_of, log_fn)
+    if not DISABLE_PRICE_SPLIT:
+        groups = _price_split_jenks2(groups, emb_of, log_fn,
+                                     min_gvf=TUNE_JENKS_GVF,
+                                     min_center_ratio=TUNE_JENKS_RATIO,
+                                     max_emb_cos=TUNE_JENKS_COS)
 
     # Sprint-7 #5: drop floor-priced listing-bait (€10 stubs) into side
     # #floorspam cluster BEFORE bi-tail so the MAD calculation sees clean
@@ -2643,7 +2918,8 @@ def refine_clusters(items: list[dict], mapping: dict[int, str], conn,
     # bundles at unusual prices) into a side '<key> #high' cluster so the main
     # cluster is a clean population for anomaly detection. ~1% items move,
     # CV main halves on average. See dry_run in scripts/.
-    groups = _right_tail_split(groups, log_fn)
+    if not DISABLE_PRICE_SPLIT and not DISABLE_BITAIL:
+        groups = _right_tail_split(groups, log_fn, mad_k=TUNE_BITAIL_MADK)
 
     # Sprint-4: SECOND Jenks2 pass on the bi-tail residual. The MAIN cluster
     # of a heavily-split cluster (e.g. one with #high1 #high2 #low1 #low2)
@@ -2653,19 +2929,26 @@ def refine_clusters(items: list[dict], mapping: dict[int, str], conn,
     # catch the residual split. Empirical: ~5-10% extra splits.
     # #10: optionally drop this 2nd pass to test whether it adds signal or
     # just fragments clusters below the deal-detector's MIN_CLUSTER floor.
-    if not CONSOLIDATE_PRICE_SPLIT:
-        groups = _price_split_jenks2(groups, emb_of, log_fn)
+    if not CONSOLIDATE_PRICE_SPLIT and not DISABLE_PRICE_SPLIT:
+        groups = _price_split_jenks2(groups, emb_of, log_fn,
+                                     min_gvf=TUNE_JENKS_GVF,
+                                     min_center_ratio=TUNE_JENKS_RATIO,
+                                     max_emb_cos=TUNE_JENKS_COS)
 
     # Sprint-7 #3: merge sibling fragments <base>#1/#2/#3 that share the same
     # product (cos≥0.97) and have similar median price (ratio≤1.15). Fixes
     # the iPhone 11 / Switch OLED fragmentation caused by price-feature
     # splitting same-product price tiers within brand-homogeneous partitions.
-    groups = _merge_sibling_fragments(groups, emb_of, log_fn)
+    groups = _merge_sibling_fragments(groups, emb_of, log_fn,
+                                      max_median_ratio=TUNE_SIBLING_RATIO,
+                                      min_emb_cos=TUNE_SIBLING_COS)
 
     # Sprint-7 #7: lex-sig merge — coalesce clusters with shared brand AND
     # shared model number (e.g. 'apple iphone 11' + 'iphone 11' across batches)
     # when text centroids agree (cos≥0.96) and prices compatible (ratio≤1.25).
-    groups = _merge_by_lex_signature(groups, emb_of, log_fn)
+    groups = _merge_by_lex_signature(groups, emb_of, log_fn,
+                                     min_emb_cos=TUNE_LEXSIG_COS,
+                                     max_median_ratio=TUNE_LEXSIG_RATIO)
 
     # Sprint-7 #4: split mappazzoni — large clusters (size≥50) where >50% of
     # titles start with different first-tokens are HDBSCAN aggregates on
@@ -2677,6 +2960,24 @@ def refine_clusters(items: list[dict], mapping: dict[int, str], conn,
     # near-homograph SKUs (i5 6600 vs i5 6500) that the text encoder merges.
     if ENABLE_MODEL_TOKEN_SPLIT:
         groups = _split_by_model_token(groups, log_fn)
+
+    # storage-aware model-identity split (all clusters): separate iPhone 12/13,
+    # Galaxy S21/S22, i5-6600/6500 that HDBSCAN merged.
+    if ENABLE_PRODUCT_SPLIT:
+        groups = _split_by_product_id(groups, log_fn)
+
+    # Adaptive cohesion-gated outlier ejection (tight clusters reject intruders).
+    if ENABLE_OUTLIER_EJECT:
+        groups = _eject_embedding_outliers(groups, emb_of, log_fn,
+                                           k=TUNE_EJECT_K,
+                                           min_median_cos=TUNE_EJECT_MINMED,
+                                           max_keep_cos=TUNE_EJECT_FLOOR)
+
+    # FINAL de-mixer: catch device+accessory/game price mixtures (incl. ones the
+    # merges re-created) that the emb-gated Jenks2 can't split (shared brand token).
+    if ENABLE_MIXTURE_SPLIT:
+        groups = _mixture_split(groups, log_fn,
+                                min_gvf=TUNE_MIX_GVF, min_ratio=TUNE_MIX_RATIO)
 
     # Final mapping + recomputed centroids.
     now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2697,8 +2998,11 @@ def refine_clusters(items: list[dict], mapping: dict[int, str], conn,
             best_cat = max(cat_counts, key=cat_counts.get)
             if cat_counts[best_cat] / max(1, len(v)) >= 0.30:
                 top_cat = best_cat
+        pr = sorted(float(it["price"]) for it in v
+                    if it.get("price") and it["price"] > 0)
+        price_med = pr[len(pr) // 2] if pr else None
         rows.append((k, _emb_to_blob(mean_vec.astype("float32")), len(v), now_ts,
-                     _display_label(k, top_cat)))
+                     _display_label(k, top_cat), price_med))
     _persist_centroids(conn, rows, wipe=True)
     log_fn(f"  refined: {len(groups)} clusters, {len(rows)} centroids")
     return mapping
@@ -2813,7 +3117,7 @@ def image_refine(mapping: dict[int, str], items: list[dict], img_of: dict,
         groups.setdefault(mapping[it["id"]], []).append(it)
     H = _get_hdbscan().HDBSCAN
     out = dict(mapping)
-    n_split = n_no_signal = n_imgcos_block = n_price_block = 0
+    n_split = n_no_signal = n_imgcos_block = n_price_block = n_jaccard_block = 0
     for k, v in groups.items():
         if len(v) < IMAGE_REFINE_MIN:
             continue
@@ -2900,7 +3204,7 @@ def image_refine(mapping: dict[int, str], items: list[dict], img_of: dict,
                     if j_val > max_jaccard:
                         max_jaccard = j_val
         if max_jaccard < 0.10:
-            n_jaccard_block = locals().get("n_jaccard_block", 0) + 1
+            n_jaccard_block += 1
             continue
 
         n_split += 1
@@ -2908,7 +3212,6 @@ def image_refine(mapping: dict[int, str], items: list[dict], img_of: dict,
             if l != -1:
                 out[it["id"]] = f"{k} #img{int(l)}"
     if n_split or n_imgcos_block or n_price_block:
-        n_jaccard_block = locals().get("n_jaccard_block", 0)
         log_fn(f"  image-refine: {n_split} cluster spaccati per immagine, "
                f"{n_imgcos_block} bloccati da img-cos-check, "
                f"{n_price_block} bloccati da price-ratio (stessa popolazione di prezzo), "
@@ -2934,15 +3237,22 @@ def match_cluster_batch(items: list[dict], conn,
         return {it["id"]: (None, 0.0) for it in items}
 
     centroids: dict[str, "np.ndarray"] = {}
-    for row in conn.execute(
-        "SELECT cluster_key, embedding FROM cluster_centroids"
-    ):
+    medians: dict[str, float | None] = {}
+    try:
+        rows_c = list(conn.execute(
+            "SELECT cluster_key, embedding, price_median FROM cluster_centroids"))
+    except Exception:
+        rows_c = [(r[0], r[1], None) for r in conn.execute(
+            "SELECT cluster_key, embedding FROM cluster_centroids")]
+    for row in rows_c:
         try:
             centroids[row[0]] = _blob_to_emb(row[1])
+            medians[row[0]] = row[2]
         except Exception:
             continue
     if not centroids:
         return {it["id"]: (None, 0.0) for it in items}
+    band_index = _band_base_index(medians) if BAND_AWARE_MATCH else {}
 
     model = _get_model()
     titles = [_embed_text(it) for it in items]
@@ -2957,7 +3267,11 @@ def match_cluster_batch(items: list[dict], conn,
         js = sims_all.argmax(axis=1)
         for idx, it in enumerate(items):
             j = int(js[idx]); s = float(sims_all[idx, j])
-            out[it["id"]] = (ckeys[j], s) if s >= threshold else (None, max(s, 0.0))
+            if s >= threshold:
+                key = _band_route(ckeys[j], it.get("price"), band_index)
+                out[it["id"]] = (key, s)
+            else:
+                out[it["id"]] = (None, max(s, 0.0))
         return out
 
     for it, emb in zip(items, embs):
@@ -2967,6 +3281,7 @@ def match_cluster_batch(items: list[dict], conn,
             if sim > best_sim:
                 best_sim, best_key = sim, ck
         if best_sim >= threshold:
+            best_key = _band_route(best_key, it.get("price"), band_index)
             out[it["id"]] = (best_key, best_sim)
         else:
             out[it["id"]] = (None, best_sim if best_sim >= 0 else 0.0)

@@ -21,8 +21,11 @@ from bench import benchmark
 from ab_harness import sep_metric
 
 CACHE = ROOT / "data" / "ab_cache"
-RAW_SUB = CACHE / "raw_sub.json"
-RUN_IMAGE = os.environ.get("AB_IMAGE", "0") == "1"   # image_refine on/off
+# CLI flags (preferred — keeps every command starting with `python3.13` so the
+# permission allowlist matches) with env fallback.
+RUN_IMAGE = ("--image" in sys.argv) or os.environ.get("AB_IMAGE", "0") == "1"
+SHARD = ("--no-shard" not in sys.argv) and os.environ.get("AB_SHARD", "1") == "1"
+RAW_SUB = CACHE / ("raw_sub_shard.json" if SHARD else "raw_sub.json")
 
 
 def load_subset():
@@ -54,8 +57,10 @@ def raw_partition(items, emb):
     if RAW_SUB.exists():
         return {int(k): v for k, v in json.load(open(RAW_SUB)).items()}
     conn, p = _temp_conn(); t0 = time.time()
+    cl.PARALLEL_SHARD_LARGE = SHARD          # parallelize the giant partitions
     m = cl.cluster_partitioned(items, conn=conn, min_cluster_size=2,
                                log_fn=lambda *a, **k: None, emb_cache=emb)
+    cl.PARALLEL_SHARD_LARGE = False
     conn.close(); os.unlink(p)
     json.dump({str(k): v for k, v in m.items()}, open(RAW_SUB, "w"))
     print(f"  [partition] {len(set(m.values()))} clusters in {time.time()-t0:.0f}s "
@@ -77,7 +82,8 @@ def refine(items, raw, emb, img):
 
 def reset():
     for f in ("ENABLE_MODEL_TOKEN_SPLIT", "STABLE_MERGE_KEY", "LOGSPACE_BITAIL",
-              "CONSOLIDATE_PRICE_SPLIT", "PARALLEL_SHARD_LARGE"):
+              "CONSOLIDATE_PRICE_SPLIT", "PARALLEL_SHARD_LARGE", "DISABLE_PRICE_SPLIT",
+              "DISABLE_BITAIL"):
         setattr(cl, f, False)
 
 
@@ -94,12 +100,18 @@ def main():
     items, emb, img = load_subset()
     print(f"subset: {len(items)} items, {len(img)} img vecs, image_refine={RUN_IMAGE}\n", flush=True)
     raw = raw_partition(items, emb)
+    # sanity: the raw partition (no refine) is the floor; refine must beat it.
+    evaluate(items, {it["id"]: raw.get(it["id"], "unknown") for it in items},
+             emb, "RAW (no refine)")
     variants = [
         ("BASELINE", {}),
         ("#2 model-token", {"ENABLE_MODEL_TOKEN_SPLIT": True}),
         ("#8 stable-merge", {"STABLE_MERGE_KEY": True}),
         ("#6 bitail-log", {"LOGSPACE_BITAIL": True}),
         ("#10 drop-2nd-jenks", {"CONSOLIDATE_PRICE_SPLIT": True}),
+        ("no-bitail (keep Jenks2)", {"DISABLE_BITAIL": True}),
+        ("no-price-split", {"DISABLE_PRICE_SPLIT": True}),
+        ("#8 + no-bitail", {"STABLE_MERGE_KEY": True, "DISABLE_BITAIL": True}),
         ("ALL", {"ENABLE_MODEL_TOKEN_SPLIT": True, "STABLE_MERGE_KEY": True,
                  "LOGSPACE_BITAIL": True}),
     ]

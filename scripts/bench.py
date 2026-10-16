@@ -27,9 +27,18 @@ Reported axes (means over qualifying clusters) + coverage + SEP + legacy SCORE.
 Detector-agnostic: a config that scores higher ABQ will give any sane future
 detector cleaner baselines and fewer false positives.
 """
-import sys, os, math, collections, statistics as st
+import sys, os, math, re, collections, statistics as st
 from pathlib import Path
 import numpy as np
+
+_YEAR = re.compile(r"^(19|20)\d\d$")     # listing years are NOT product specs
+
+
+def _spec_nums(title, brand):
+    """Numeric model/spec tokens, with listing-years stripped (they pollute
+    spec-purity: '2021'/'2022' are when it was posted, not what it is)."""
+    _, nums = cl._lex_sig(title, brand)
+    return {n for n in nums if not _YEAR.match(n)}
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, "/Users/wax/Desktop/vinted_scraper-main/src")
@@ -106,50 +115,95 @@ def benchmark(items, mapping, emb, min_size=MIN):
         # brand purity
         brs = [b for b in (_canon_brand(it.get("brand")) for it in v) if b]
         bpure = (collections.Counter(brs).most_common(1)[0][1] / len(brs)) if brs else 1.0
-        # spec purity (numeric model/spec tokens)
-        nums_per = []
-        for it in v:
-            _, nums = cl._lex_sig(it.get("title", ""), it.get("brand"))
-            nums_per.append(nums)
-        flat = [n for nums in nums_per for n in nums]
-        if flat:
+        # spec purity (numeric model/spec tokens). Only judged when ENOUGH items
+        # actually carry a spec number — products without model numbers in their
+        # titles ("Nintendo Switch Lite", "Apple Watch") are not spec-impure,
+        # they're just number-less, so they get specpure=1 (no evidence of mix).
+        nums_per = [_spec_nums(it.get("title", ""), it.get("brand")) for it in v]
+        n_with = sum(1 for nums in nums_per if nums)
+        if n_with < max(5, 0.4 * len(v)):
+            specpure = 1.0
+        else:
+            flat = [n for nums in nums_per for n in nums]
             dom = collections.Counter(flat).most_common(1)[0][0]
             have = sum(1 for nums in nums_per if dom in nums)
-            specpure = have / len(v)
-        else:
-            specpure = 1.0
-        # unimodality: hidden semantic price-mixture?
+            specpure = have / n_with
+        # unimodality: a strong, populated PRICE-BIMODALITY (two separated modes,
+        # each ≥3 items) means the cluster mixes a device with its accessories/
+        # games/parts (e.g. iPhone €500 + cover €15, Switch console €210 + games
+        # €20). A single product — even new/used or storage variants — does NOT
+        # produce gvf≥0.6 with a ≥3× modal ratio. We deliberately do NOT use a
+        # text-cos gate: these mixtures share the brand+model token so their text
+        # is near-identical (cos≈0.97-0.99) — exactly why the pipeline misses them.
         unimodal = 1.0
-        pr = [(it["price"], it["id"]) for it in v if it.get("price") and it["price"] > 0
-              and it["id"] in emb]
+        pr = [it["price"] for it in v if it.get("price") and it["price"] > 0]
         if len(pr) >= 2 * 3:
-            stats = cl._jenks2_stats([p for p, _ in pr], min_band=3)
+            stats = cl._jenks2_stats(pr, min_band=3)
             if stats:
                 idx, gvf, ratio = stats
-                if gvf >= 0.60 and ratio >= 2.0:
-                    sp = sorted(pr)
-                    A = [i for _, i in sp[:idx]]; B = [i for _, i in sp[idx:]]
-                    ca = np.mean([emb[i] for i in A], axis=0)
-                    cb = np.mean([emb[i] for i in B], axis=0)
-                    ca = ca / max(np.linalg.norm(ca), 1e-12)
-                    cb = cb / max(np.linalg.norm(cb), 1e-12)
-                    if float(ca @ cb) < 0.97:
-                        unimodal = 0.0
-                        mix_items += len(v)
+                # Honest measure kept slightly BROADER than the de-mixer's split
+                # threshold (gvf 0.60 / ratio 3.0) so it can't be trivially zeroed
+                # — residual 2.5-3× mixtures still count as exposure.
+                if gvf >= 0.55 and ratio >= 2.5:
+                    unimodal = 0.0
+                    mix_items += len(v)
         margin = nearest_margin(k)
-        sep_w = min(1.0, max(0.0, margin / SEP_SCALE))
         coh = float(np.mean([cen[k] @ (emb[i] / max(np.linalg.norm(emb[i]), 1e-12))
                              for i in ids]))
-        q = bpure * specpure * unimodal * sep_w
+        # purity-only quality (single product · single spec · no mixture).
+        # Separation is reported as its OWN axis (sep) instead of multiplied in,
+        # so ABQ stays sensitive; over-split/over-merge show up as sep↓.
+        q = bpure * specpure * unimodal
         tot_q += q * len(v)
         items_used += len(v)
         n_used += 1
         sum_b += bpure; sum_s += specpure; sum_u += unimodal
         sum_sep += margin; sum_coh += coh
+    # ── MASK: deal-masking exposure from price-band splitting ────────────────
+    # HARM covers the under-split failure (mixture hides deals in noise); MASK
+    # covers the OVER-split failure: when one product is split into price bands,
+    # a real deal (−40% off band B's median) lands inside a cheaper sibling
+    # band's [p5,p95] range, where it looks like a normal listing → never
+    # flagged. Together HARM+MASK bracket the split/merge trade-off, so the
+    # objective can no longer be gamed by splitting more (or less).
+    _BAND_TAG = re.compile(r" \[€[^\]]*\]| #high\d+| #low\d+| \[\?\]")
+    fams = collections.defaultdict(list)
+    for k, v in by.items():
+        pr = sorted(it["price"] for it in v
+                    if it.get("price") and it["price"] > 0)
+        if len(pr) >= 2:
+            fams[_BAND_TAG.sub("", k)].append(pr)
+    masked_items = 0
+    for fam, bands in fams.items():
+        if len(bands) < 2:
+            continue
+        bands.sort(key=lambda pr: pr[len(pr) // 2])          # by median
+        for bi in range(1, len(bands)):
+            b = bands[bi]
+            deal = 0.60 * b[len(b) // 2]                     # −40% off median
+            for s in bands[:bi]:                             # cheaper siblings
+                lo = s[max(0, int(0.05 * len(s)))]
+                hi = s[min(len(s) - 1, int(0.95 * len(s)))]
+                if lo <= deal <= hi:
+                    masked_items += len(b)
+                    break
+
     abq = tot_q / max(1, priced_total)
+    harm = mix_items / max(1, priced_total)     # catalog share in HARMFUL mixed
+                                                # clusters (false-positive factories
+                                                # for any future detector)
+    mask = masked_items / max(1, priced_total)  # catalog share whose −40% deal
+                                                # would hide in a sibling band
     d = lambda x: x / max(1, n_used)
     return {
         "ABQ": abq,
+        "HARM": harm,
+        "MASK": mask,
+        "OBJ": abq - harm - mask,               # primary search objective:
+                                                # reward clean baselines, punish
+                                                # BOTH failure modes 1:1 —
+                                                # mixtures (under-split) and
+                                                # deal-masking (over-split)
         "coverage": 100 * items_used / max(1, priced_total),
         "bpure": d(sum_b), "specpure": d(sum_s), "unimodal": d(sum_u),
         "sep": d(sum_sep), "coh": d(sum_coh),
@@ -161,6 +215,7 @@ def benchmark(items, mapping, emb, min_size=MIN):
 def report(items, mapping, emb, label, with_legacy=True):
     b = benchmark(items, mapping, emb)
     print(f"=== {label} ===")
+    print(f"  OBJ={b['OBJ']:.3f}  HARM={b['HARM']:.3f}  MASK={b['MASK']:.3f}")
     print(f"  ABQ={b['ABQ']:.3f}  cov={b['coverage']:.1f}%  bpure={b['bpure']:.3f} "
           f"specpure={b['specpure']:.3f} unimodal={b['unimodal']:.3f} sep={b['sep']:.3f} "
           f"coh={b['coh']:.3f}  mix={b['mix_pct']:.1f}%  "

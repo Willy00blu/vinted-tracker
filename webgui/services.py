@@ -133,6 +133,36 @@ def coverage_state(cfg_id: str) -> dict:
     return _read_json(DATA_DIR / f"coverage_cat_{cfg_id}.json", {})
 
 
+DEALS_FILE = DATA_DIR / "deals.json"
+
+
+def read_deals() -> dict:
+    """Last deal-scan results written by scripts/deal_detector.py --json."""
+    return _read_json(DEALS_FILE, {"generated_at": None, "n_items": 0, "deals": []})
+
+
+# ── Dashboard query cache ────────────────────────────────────────────────────
+# The Categorie view runs a GROUP BY over ~200k rows on every refresh; a short
+# TTL cache keeps the UI snappy without meaningfully stale data (the underlying
+# monitor writes at scrape-interval granularity anyway).
+_dash_cache: dict = {}
+_DASH_TTL = 20.0
+
+
+def dash_cached(key: tuple, compute):
+    now = time.time()
+    hit = _dash_cache.get(key)
+    if hit and now - hit[0] < _DASH_TTL:
+        return hit[1]
+    val = compute()
+    _dash_cache[key] = (now, val)
+    return val
+
+
+def dash_invalidate():
+    _dash_cache.clear()
+
+
 def subcategories() -> list[tuple[str, int]]:
     """[(name, catalog_id)] of sub-categories seen in the shared DB (for the
     new-category form). Thin wrapper over core.discovery."""
@@ -232,6 +262,7 @@ class MonitorManager:
         self._seq = 0
         self._regen_active = False   # guard: one cluster regeneration at a time
         self._regen_proc: subprocess.Popen | None = None
+        self._deal_scan_active = False  # guard: one deal scan at a time
         # Image-embedding worker (core.image_worker): one global process, tied to
         # the category monitors. auto_image → auto-start it whenever a category
         # monitor is running (and re-start if it died).
@@ -356,6 +387,51 @@ class MonitorManager:
                 if sold_worker_was_on and self.auto_sold:
                     self.start_sold_check_worker()
                     self._emit(mid, "▶ sold-check worker riattivato", "muted")
+
+        threading.Thread(target=reader, daemon=True).start()
+        return True
+
+    # -- deal scan (detector v2 in a subprocess, results → data/deals.json) --
+    def deal_scan_active(self) -> bool:
+        with self._lock:
+            return self._deal_scan_active
+
+    def run_deal_scan(self, top_n: int = 300) -> bool:
+        """Run scripts/deal_detector.py --json in a subprocess (CPU/RAM heavy:
+        loads all cached text embeddings once). UI stays responsive; results
+        land in data/deals.json. Refuses while a regen or another scan runs."""
+        with self._lock:
+            if self._deal_scan_active or self._regen_active:
+                return False
+            self._deal_scan_active = True
+        self._emit("DEALS", "💎 Scansione occasioni avviata (detector v2)…", "info")
+
+        def reader():
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-u", str(BASE_DIR / "scripts" / "deal_detector.py"),
+                     "--json", str(DEALS_FILE), "--top", str(top_n)],
+                    cwd=str(BASE_DIR),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1)
+                for raw in proc.stdout:                    # type: ignore[union-attr]
+                    line = raw.rstrip()
+                    if line:
+                        tag = ("found" if line.startswith("✓")
+                               else "error" if line.startswith(("✗", "Traceback"))
+                               else "muted")
+                        self._emit("DEALS", line, tag)
+                code = proc.wait()
+                if code == 0:
+                    self._emit("DEALS", "✓ Scansione completata — apri la tab 💎 Occasioni",
+                               "found")
+                else:
+                    self._emit("DEALS", f"✗ Scansione terminata con codice {code}", "error")
+            except Exception as e:
+                self._emit("DEALS", f"✗ Errore scansione: {e}", "error")
+            finally:
+                with self._lock:
+                    self._deal_scan_active = False
 
         threading.Thread(target=reader, daemon=True).start()
         return True

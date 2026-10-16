@@ -24,9 +24,8 @@ sys.path.insert(0, str(ROOT)); sys.path.insert(0, "/Users/wax/Desktop/vinted_scr
 os.environ.setdefault("VINTED_EMBED_MODEL", "intfloat/multilingual-e5-large")
 import core.clustering as cl
 
-EMB_NPZ = "/tmp/ab_emb.npz"
-ITEMS_PKL = "/tmp/ab_items.pkl"
-MAP_JSON = "/tmp/ab_final_base.json"
+CACHE = ROOT / "data" / "ab_cache"
+MAP_JSON = str(CACHE / "final_best_map.json")
 Z_MIN = 3.0
 FIT_MIN = 0.93
 MIN_CLUSTER = 8
@@ -67,10 +66,12 @@ def _attrs(title):
 
 def load():
     import pickle
-    d = np.load(EMB_NPZ, allow_pickle=True)
-    emb = {int(i): v.astype(np.float32) for i, v in zip(d["ids"], d["emb"])}
-    items = {it["id"]: it for it in pickle.load(open(ITEMS_PKL, "rb"))}
+    E = np.load(CACHE / "emb_f16.npy", mmap_mode="r")
+    ids = np.load(CACHE / "ids.npy"); row = {int(i): j for j, i in enumerate(ids)}
     m = {int(k): v for k, v in json.load(open(MAP_JSON)).items()}
+    emb = {iid: E[row[iid]].astype(np.float32) for iid in m if iid in row}
+    items = {it["id"]: it for it in pickle.load(open(CACHE / "items.pkl", "rb"))
+             if it["id"] in emb}
     return emb, items, m
 
 

@@ -29,3 +29,7 @@ venv/
 .vscode/
 .idea/
 *.swp
+
+# Log e copie di lavoro
+logs/
+*.bak.*

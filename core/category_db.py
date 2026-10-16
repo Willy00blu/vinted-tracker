@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
     embedding         BLOB NOT NULL,
     item_count        INTEGER DEFAULT 1,
     last_updated_at   TEXT,
-    display_label     TEXT
+    display_label     TEXT,
+    price_median      REAL          -- band-aware matcher (see migrations note)
 );
 """
 
@@ -117,6 +118,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "ALTER TABLE items ADD COLUMN last_checked_at TEXT",
         "CREATE INDEX IF NOT EXISTS idx_items_last_checked ON items(last_checked_at)",
         "ALTER TABLE cluster_centroids ADD COLUMN display_label TEXT",
+        # Median price of the cluster's members at (re)generation time. Needed
+        # by the band-aware incremental matcher: price-band siblings ([€a-b] /
+        # #high / #low of the same product) have near-identical TEXT centroids,
+        # so new items are routed among siblings by price adjacency instead of
+        # coin-flip cosine. NULL for clusters written by older code → matcher
+        # falls back to pure cosine.
+        "ALTER TABLE cluster_centroids ADD COLUMN price_median REAL",
         # Snapshot of favourite_count at the moment we marked the item sold —
         # the live items.favourite_count keeps drifting as the feed re-scrapes
         # active items, so we need a frozen value for sold-time analytics.

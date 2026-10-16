@@ -10,7 +10,14 @@ and core/. State is module-level (single local user).
 from __future__ import annotations
 
 import asyncio
+import math
+import re
+import statistics as _st
 from nicegui import ui, context
+
+# price-band suffixes produced by the refine pipeline (Jenks2 / bi-tail /
+# mixture-split) — used to group sibling bands of the same product in the UI
+_BAND_RE = re.compile(r" \[€[^\]]*\]| #high\d+| #low\d+| \[\?\]")
 
 
 def _safe_timer(interval: float, callback, *, once: bool = False):
@@ -192,8 +199,15 @@ def searches_detail():
 # ── Categorie ────────────────────────────────────────────────────────────────
 
 def _cat_dashboard_data(cfg):
-    """Read the shared DB filtered to this category's catalog_ids."""
+    """Read the shared DB filtered to this category's catalog_ids.
+    TTL-cached (svc.dash_cached): the GROUP BY over ~200k rows must not run on
+    every UI refresh."""
     view = cfg.get("soldcheck_catalog_ids") or None
+    key = ("dash", tuple(view) if view else None)
+    return svc.dash_cached(key, lambda: _cat_dashboard_compute(view))
+
+
+def _cat_dashboard_compute(view):
     out = {"stats": {"total": 0, "active": 0, "sold": 0, "median_listed": None, "median_sold": None},
            "clusters": [], "drops": [], "sold": [], "dist": [], "last": None, "view": view}
     db = shared_db_path()
@@ -418,11 +432,55 @@ def _open_cluster_popup(key):
             items = all_items_for_cluster(conn, key, catalog_ids=cats)
             cstats = stats_for_cluster(conn, key, catalog_ids=cats)
             hist = sold_history_for_cluster(conn, key, catalog_ids=cats)
+            # sibling price bands of the same product family ([€a-b], #high…):
+            # same base key once band tags are stripped. LIKE narrows the scan,
+            # the Python check makes it exact.
+            base = _BAND_RE.sub("", key)
+            sibs = []
+            try:
+                for r in conn.execute(
+                        "SELECT cluster_key, COUNT(*) n, "
+                        "AVG(CASE WHEN presumed_sold=0 THEN price END) avg_p "
+                        "FROM items WHERE removed=0 AND cluster_key LIKE ? || '%' "
+                        "GROUP BY cluster_key", (base,)):
+                    if _BAND_RE.sub("", r[0]) == base:
+                        sibs.append((r[0], r[1], r[2]))
+            except Exception:
+                pass
     except Exception as e:
         ui.notify(f"DB error: {e}", type="negative"); return
+
+    # robust per-item z (deal side) on the ACTIVE priced population
+    act_lp = [math.log(it["price"]) for it in items
+              if not it["presumed_sold"] and (it["price"] or 0) > 0]
+    z_of = None
+    if len(act_lp) >= 5:
+        zmed = _st.median(act_lp)
+        zmad = _st.median(abs(x - zmed) for x in act_lp)
+        if zmad < 1e-6:
+            zmad = (_st.pstdev(act_lp) or 1e-6) * 0.6745
+        sig = 1.4826 * zmad
+        z_of = lambda p: (zmed - math.log(p)) / sig if p and p > 0 else 0.0
+
     charts = []  # ECharts must be resized once the dialog is actually visible
     with ui.dialog() as dlg, ui.card().classes("w-[760px]"):
         ui.label(f"Cluster: {key}  ({len(items)} item)").classes("text-lg font-bold")
+
+        # sibling band navigator (only when the product family has ≥2 bands)
+        if len(sibs) >= 2:
+            with ui.row().classes("items-center gap-1 flex-wrap"):
+                ui.label("bande:").classes("text-xs text-grey-5")
+                for skey, sn, savg in sorted(sibs, key=lambda s: s[2] or 0):
+                    tag = skey[len(base):].strip() or "(base)"
+                    lab = f"{tag} · {sn}x" + (f" ~€{savg:.0f}" if savg else "")
+                    ui.chip(lab,
+                            on_click=(lambda k2=skey: (dlg.close(),
+                                                       _open_cluster_popup(k2)))
+                            if skey != key else None) \
+                        .props("dense square " +
+                               ("color=primary" if skey == key else
+                                "color=grey-9 clickable")) \
+                        .classes("text-xs")
 
         # stat cards
         with ui.row().classes("w-full gap-2"):
@@ -481,14 +539,23 @@ def _open_cluster_popup(key):
             {"name": "status", "label": "Stato", "field": "status", "align": "left"},
             {"name": "fav", "label": "♥", "field": "fav"},
             {"name": "price", "label": "€", "field": "price", "sortable": True},
+            {"name": "z", "label": "Δσ", "field": "z", "sortable": True},
             {"name": "title", "label": "Titolo", "field": "title", "align": "left"},
         ]
         rows = []
         for it in items:
             sold = bool(it["presumed_sold"])
+            price = int((it["presumed_sold_price"] if sold else it["price"]) or 0)
+            zs = ""
+            if z_of is not None and not sold and price > 0:
+                zv = z_of(price)
+                if zv >= 2.5:
+                    zs = f"🔥 +{zv:.1f}"      # anomalously CHEAP → potential deal
+                elif zv >= 1.5:
+                    zs = f"+{zv:.1f}"
             rows.append({"status": "venduto" if sold else f"attivo {it['seen_count']}×",
                          "fav": it["favourite_count"] or 0,
-                         "price": int((it["presumed_sold_price"] if sold else it["price"]) or 0),
+                         "price": price, "z": zs,
                          "title": it["title"], "url": f"https://www.vinted.it/items/{it['id']}"})
         t = ui.table(columns=cols, rows=rows, row_key="url", pagination=15).classes("w-full")
         with t.add_slot("top-right"):
@@ -600,6 +667,126 @@ def _new_category_dialog():
             ui.button("Annulla", on_click=dlg.close).props("flat")
             ui.button("Crea", on_click=create).props("color=primary")
     dlg.open()
+
+
+# ── 💎 Occasioni (detector v2) ───────────────────────────────────────────────
+
+class _DealsUI:
+    """Local filter state for the deals view."""
+    min_disc: int = 30
+    min_conf: float = 0.0
+
+
+@ui.refreshable
+def deals_view():
+    d = svc.read_deals()
+    deals = d.get("deals", [])
+    scanning = mm.deal_scan_active()
+
+    with ui.row().classes("items-center w-full"):
+        ui.label("💎 Occasioni").classes("text-xl font-bold")
+        if d.get("generated_at"):
+            ui.label(f"ultima scansione {svc.time_ago(d['generated_at'])} · "
+                     f"{d.get('n_items', 0):,} item analizzati".replace(",", "."))\
+                .classes("text-xs text-grey-5 ml-2")
+        else:
+            ui.label("nessuna scansione ancora — premi Scansiona").classes(
+                "text-xs text-grey-5 ml-2")
+        ui.space()
+        if scanning:
+            ui.spinner(size="1.4em")
+            ui.label("scansione in corso…").classes("text-sm text-amber")
+        else:
+            def _scan():
+                if mm.regen_active():
+                    ui.notify("Rigenerazione cluster in corso — riprova dopo.",
+                              type="warning")
+                    return
+                if mm.run_deal_scan():
+                    ui.notify("Scansione avviata (1-2 min) — progresso nell'Activity log",
+                              type="positive")
+                    deals_view.refresh()
+                else:
+                    ui.notify("Una scansione è già in corso.", type="warning")
+            ui.button("💎 Scansiona ora", on_click=_scan).props("color=primary dense")
+
+    ui.label("conf = z·fit·qualità: quanto il prezzo è anomalo × quanto l'item è davvero "
+             "quel prodotto × quanto è affidabile la baseline del cluster").classes(
+        "text-xs text-grey-6")
+
+    with ui.row().classes("items-center gap-4 mt-1"):
+        ui.label("Sconto min:").classes("text-xs text-grey-5")
+        disc_sel = ui.select({0: "tutti", 20: "≥20%", 30: "≥30%", 40: "≥40%", 50: "≥50%"},
+                             value=_DealsUI.min_disc).props("dense options-dense")
+        disc_sel.on_value_change(lambda e: (setattr(_DealsUI, "min_disc", e.value),
+                                            deals_view.refresh()))
+        ui.label("Conf min:").classes("text-xs text-grey-5")
+        conf_sel = ui.select({0.0: "tutte", 1.0: "≥1", 2.0: "≥2", 3.0: "≥3"},
+                             value=_DealsUI.min_conf).props("dense options-dense")
+        conf_sel.on_value_change(lambda e: (setattr(_DealsUI, "min_conf", e.value),
+                                            deals_view.refresh()))
+
+    rows = []
+    for dl in deals:
+        if dl["discount_pct"] < _DealsUI.min_disc or dl["conf"] < _DealsUI.min_conf:
+            continue
+        rows.append({
+            "conf": dl["conf"], "disc": f"-{dl['discount_pct']}%",
+            "price": f"€{dl['price']:.0f}", "median": f"€{dl['median']:.0f}",
+            "size": dl["cluster_size"], "title": dl["title"],
+            "cluster": _BAND_RE.sub("", dl["cluster_key"]).split("/")[-1][:34],
+            "ckey": dl["cluster_key"], "url": dl["url"],
+            "z": dl["z"], "q": dl["quality"], "photo": dl.get("photo") or "",
+            "saving": dl.get("saving") or 0,
+        })
+    if not rows and deals:
+        ui.label("Nessuna occasione con questi filtri — allenta sconto/conf.")\
+            .classes("text-grey-5 p-4")
+    cols = [
+        {"name": "photo", "label": "", "field": "photo"},
+        {"name": "conf", "label": "Conf", "field": "conf", "sortable": True},
+        {"name": "disc", "label": "Sconto", "field": "disc", "sortable": True},
+        {"name": "price", "label": "€", "field": "price", "sortable": True},
+        {"name": "median", "label": "€ mediana", "field": "median"},
+        {"name": "saving", "label": "€ risparmio", "field": "saving", "sortable": True},
+        {"name": "size", "label": "n", "field": "size", "sortable": True},
+        {"name": "title", "label": "Titolo", "field": "title", "align": "left"},
+        {"name": "cluster", "label": "Cluster", "field": "cluster", "align": "left"},
+    ]
+    tbl = ui.table(columns=cols, rows=rows, row_key="url", pagination=25)\
+        .classes("w-full mt-2")
+    with tbl.add_slot("top-right"):
+        ui.input(placeholder="cerca…").props("dense clearable").bind_value(tbl, "filter")
+    # photo thumbnail (lazy-loaded straight from the Vinted CDN)
+    with tbl.add_slot("body-cell-photo", """
+        <q-td :props="props" style="width:56px">
+          <img v-if="props.value" :src="props.value" loading="lazy"
+               style="width:48px;height:48px;object-fit:cover;border-radius:6px"/>
+        </q-td>
+    """):
+        pass
+    # discount cell in green bold; cluster cell clickable → popup
+    with tbl.add_slot("body-cell-disc", """
+        <q-td :props="props">
+          <span class="text-green text-weight-bold">{{ props.value }}</span>
+        </q-td>
+    """):
+        pass
+    with tbl.add_slot("body-cell-cluster", """
+        <q-td :props="props">
+          <a class="text-blue-4 cursor-pointer"
+             @click.stop="$parent.$emit('clickCluster', props.row.ckey)">
+            {{ props.value }}
+          </a>
+        </q-td>
+    """):
+        pass
+    tbl.on("clickCluster", lambda e: _open_cluster_popup(e.args))
+    tbl.on("rowClick", lambda e: _open_url(e.args[1].get("url")))
+
+    # auto-refresh while a scan runs so results appear as soon as it finishes
+    if scanning:
+        _safe_timer(3.0, deals_view.refresh, once=True)
 
 
 # ── Esplora ──────────────────────────────────────────────────────────────────
@@ -718,8 +905,9 @@ def main_page():
                     mm.auto_sold = True
                     mm.start_sold_check_worker()
             sc_btn = ui.button("sold-check", on_click=_toggle_soldcheck).props("flat dense")
-            ui.button("↻ Refresh", on_click=lambda: (reload_monitors(), sidebar.refresh(),
-                      searches_detail.refresh(), category_detail.refresh())).props("flat dense")
+            ui.button("↻ Refresh", on_click=lambda: (svc.dash_invalidate(), reload_monitors(),
+                      sidebar.refresh(), searches_detail.refresh(),
+                      category_detail.refresh(), deals_view.refresh())).props("flat dense")
 
     # Run the (blocking) network probe off-thread, then update the UI.
     async def net_check():
@@ -761,6 +949,7 @@ def main_page():
 
     with ui.tabs().classes("w-full") as tabs:
         t_search = ui.tab("▶ Ricerche")
+        t_deals = ui.tab("💎 Occasioni")
         t_expl = ui.tab("🔥 Esplora")
         t_cat = ui.tab("📊 Categorie")
 
@@ -771,6 +960,8 @@ def main_page():
             category_detail.refresh()
         elif e.value == "▶ Ricerche":
             searches_detail.refresh()
+        elif e.value == "💎 Occasioni":
+            deals_view.refresh()
     tabs.on_value_change(_on_tab)
 
     with ui.tab_panels(tabs, value=t_search).classes("w-full"):
@@ -781,6 +972,8 @@ def main_page():
                     sidebar("text")
                 with ui.column().classes("flex-1 min-w-0"):
                     searches_detail()
+        with ui.tab_panel(t_deals):
+            deals_view()
         with ui.tab_panel(t_expl):
             explore_view()
         with ui.tab_panel(t_cat):
